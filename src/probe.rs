@@ -7,16 +7,16 @@ use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct Probe {
-    method: Method,
-    initial_delay: Duration,
-    period: Duration,
-    timeout: Duration,
-    success_threshold: usize,
-    failure_threshold: usize,
+    pub method: Method,
+    pub initial_delay: Duration,
+    pub period: Duration,
+    pub timeout: Duration,
+    pub success_threshold: usize,
+    pub failure_threshold: usize,
 }
 
 #[derive(Clone, Debug)]
-enum Method {
+pub enum Method {
     Exec {
         command: (String, Vec<String>),
     },

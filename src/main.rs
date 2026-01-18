@@ -83,63 +83,7 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(args.bind).await?;
             axum::serve(listener, app).await
         },
-        futures::future::join_all(probe.iter().map(|(name, probe, status)| {
-            async {
-                if let Some(probe) = &probe.startup {
-                    let mut stream = pin::pin!(
-                        probe
-                            .watch(&context)
-                            .instrument(tracing::info_span!("startup"))
-                    );
-                    while let Some(status) = stream.next().await {
-                        if status == probe::Status::Success {
-                            break;
-                        }
-                    }
-                }
-                futures::future::join(
-                    async {
-                        if let Some(probe) = &probe.liveness {
-                            let mut stream = pin::pin!(
-                                probe
-                                    .watch(&context)
-                                    .instrument(tracing::info_span!("liveness"))
-                            );
-                            while let Some(s) = stream.next().await {
-                                if s == probe::Status::Failure {
-                                    status.liveness.store(false, Ordering::Relaxed);
-                                    break;
-                                }
-                            }
-                        }
-                    },
-                    async {
-                        if let Some(probe) = &probe.readiness {
-                            let mut stream = pin::pin!(
-                                probe
-                                    .watch(&context)
-                                    .instrument(tracing::info_span!("readiness"))
-                            );
-                            while let Some(s) = stream.next().await {
-                                match s {
-                                    probe::Status::Success => {
-                                        status.readiness.store(true, Ordering::Relaxed)
-                                    }
-                                    probe::Status::Failure => {
-                                        status.readiness.store(false, Ordering::Relaxed)
-                                    }
-                                }
-                            }
-                        } else {
-                            status.readiness.store(true, Ordering::Relaxed)
-                        }
-                    },
-                )
-                .await;
-            }
-            .instrument(tracing::info_span!("probe", name))
-        }))
-        .map(Ok),
+        update(&context, &*probe).map(Ok),
     )
     .await?;
 
@@ -169,3 +113,69 @@ impl Default for Status {
         }
     }
 }
+
+fn update<'a, I>(context: &'a probe::Context, probe: I) -> impl Future<Output = ()> + 'a
+where
+    I: IntoIterator<Item = &'a (String, Probe, Status)>,
+{
+    futures::future::join_all(probe.into_iter().map(|(name, probe, status)| {
+        async move {
+            if let Some(probe) = &probe.startup {
+                let mut stream = pin::pin!(
+                    probe
+                        .watch(context)
+                        .instrument(tracing::info_span!("startup"))
+                );
+                while let Some(status) = stream.next().await {
+                    if status == probe::Status::Success {
+                        break;
+                    }
+                }
+            }
+            futures::future::join(
+                async {
+                    if let Some(probe) = &probe.liveness {
+                        let mut stream = pin::pin!(
+                            probe
+                                .watch(context)
+                                .instrument(tracing::info_span!("liveness"))
+                        );
+                        while let Some(s) = stream.next().await {
+                            if s == probe::Status::Failure {
+                                status.liveness.store(false, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                },
+                async {
+                    if let Some(probe) = &probe.readiness {
+                        let mut stream = pin::pin!(
+                            probe
+                                .watch(context)
+                                .instrument(tracing::info_span!("readiness"))
+                        );
+                        while let Some(s) = stream.next().await {
+                            match s {
+                                probe::Status::Success => {
+                                    status.readiness.store(true, Ordering::Relaxed)
+                                }
+                                probe::Status::Failure => {
+                                    status.readiness.store(false, Ordering::Relaxed)
+                                }
+                            }
+                        }
+                    } else {
+                        status.readiness.store(true, Ordering::Relaxed)
+                    }
+                },
+            )
+            .await;
+        }
+        .instrument(tracing::info_span!("probe", name))
+    }))
+    .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests;
