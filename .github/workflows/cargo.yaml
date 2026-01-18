@@ -1,11 +1,6 @@
 name: cargo
-
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
 jobs:
   cargo-fmt:
     runs-on: ubuntu-latest
