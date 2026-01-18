@@ -19,14 +19,12 @@ where
     B: http_body::Body + Send,
     B::Data: Send,
 {
-    let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
-    connector.enforce_http(false);
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http()
         .enable_http1()
         .enable_http2()
-        .wrap_connector(connector);
+        .build();
     hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build(connector)
 }
