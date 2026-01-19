@@ -3,7 +3,9 @@ mod de;
 use crate::hyper;
 use bytes::Bytes;
 use futures::{FutureExt, Stream};
+use std::fmt;
 use std::time::Duration;
+use tracing_futures::Instrument;
 
 #[derive(Clone, Debug)]
 pub struct Probe {
@@ -49,34 +51,37 @@ impl Probe {
             success: 0,
             failure: 0,
         };
-        futures::stream::unfold(state, async |mut state| {
-            loop {
-                tokio::time::sleep_until(state.deadline).await;
-                state.deadline += self.period;
+        futures::stream::unfold(state, |mut state| {
+            async {
+                loop {
+                    tokio::time::sleep_until(state.deadline).await;
+                    state.deadline += self.period;
 
-                match tokio::time::timeout(self.timeout, self.method.call(context))
-                    .map(|output| output?)
-                    .await
-                {
-                    Ok(_) => {
-                        tracing::info!("ok");
-                        state.success += 1;
-                        state.failure = 0;
+                    match tokio::time::timeout(self.timeout, self.method.call(context))
+                        .map(|output| output?)
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!("ok");
+                            state.success += 1;
+                            state.failure = 0;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = e.to_string());
+                            state.success = 0;
+                            state.failure += 1;
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = e.to_string());
-                        state.success = 0;
-                        state.failure += 1;
-                    }
-                }
 
-                if state.success == self.success_threshold {
-                    break Some((Status::Success, state));
-                }
-                if state.failure == self.failure_threshold {
-                    break Some((Status::Failure, state));
+                    if state.success == self.success_threshold {
+                        break Some((Status::Success, state));
+                    }
+                    if state.failure == self.failure_threshold {
+                        break Some((Status::Failure, state));
+                    }
                 }
             }
+            .instrument(self.method.span())
         })
     }
 }
@@ -108,5 +113,33 @@ impl Method {
             }
         }
         Ok(())
+    }
+
+    fn span(&self) -> tracing::Span {
+        match self {
+            Self::Exec {
+                command: (program, args),
+            } => {
+                struct Command<'a> {
+                    program: &'a String,
+                    args: &'a Vec<String>,
+                }
+
+                impl fmt::Debug for Command<'_> {
+                    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        fmt.debug_list()
+                            .entry(self.program)
+                            .entries(self.args)
+                            .finish()
+                    }
+                }
+
+                let command = Command { program, args };
+                tracing::info_span!("exec", ?command)
+            }
+            Self::HttpGet { uri, .. } => {
+                tracing::info_span!("http_get", ?uri)
+            }
+        }
     }
 }
