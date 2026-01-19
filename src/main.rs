@@ -6,7 +6,6 @@ use clap::Parser;
 use futures::{FutureExt, StreamExt};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +15,8 @@ use tracing_futures::Instrument;
 struct Args {
     #[clap(long)]
     bind: SocketAddr,
-    #[clap(long)]
-    probe: PathBuf,
+    #[clap(long, value_parser = parse_target)]
+    target: Vec<Target>,
 }
 
 #[tokio::main]
@@ -26,35 +25,28 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let probe = toml::from_slice::<
-        serde_with::de::DeserializeAsWrap<
-            Vec<(String, Probe)>,
-            serde_with::Map<serde_with::Same, serde_with::Same>,
-        >,
-    >(&tokio::fs::read(&args.probe).await?)?;
-
     let tls_config = hyper::tls_config()?;
     let context = probe::Context {
         client: hyper::client(tls_config),
     };
 
-    let probe = probe
-        .into_inner()
+    let targets = args
+        .target
         .into_iter()
-        .map(|(name, probe)| (name, probe, Status::default()))
+        .map(|target| (target, Status::default()))
         .collect::<Arc<[_]>>();
 
     futures::future::try_join(
         async {
             let app = Router::new()
                 .route(
-                    "/liveness",
+                    "/live",
                     routing::get({
-                        let probe = probe.clone();
+                        let targets = targets.clone();
                         async move || {
-                            if probe
+                            if targets
                                 .iter()
-                                .all(|(_, _, status)| status.liveness.load(Ordering::Relaxed))
+                                .all(|(_, status)| status.live.load(Ordering::Relaxed))
                             {
                                 http::StatusCode::OK
                             } else {
@@ -64,13 +56,13 @@ async fn main() -> anyhow::Result<()> {
                     }),
                 )
                 .route(
-                    "/readiness",
+                    "/ready",
                     routing::get({
-                        let probe = probe.clone();
+                        let targets = targets.clone();
                         async move || {
-                            if probe
+                            if targets
                                 .iter()
-                                .all(|(_, _, status)| status.readiness.load(Ordering::Relaxed))
+                                .all(|(_, status)| status.ready.load(Ordering::Relaxed))
                             {
                                 http::StatusCode::OK
                             } else {
@@ -83,98 +75,99 @@ async fn main() -> anyhow::Result<()> {
             let listener = tokio::net::TcpListener::bind(args.bind).await?;
             axum::serve(listener, app).await
         },
-        update(&context, &*probe).map(Ok),
+        futures::future::join_all(
+            targets
+                .iter()
+                .map(|(target, status)| update(&context, target, status)),
+        )
+        .map(Ok),
     )
     .await?;
 
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct Probe {
-    #[serde(rename = "liveness_probe")]
-    liveness: Option<probe::Probe>,
-    #[serde(rename = "readiness_probe")]
-    readiness: Option<probe::Probe>,
-    #[serde(rename = "startup_probe")]
-    startup: Option<probe::Probe>,
+#[derive(Clone, Deserialize)]
+struct Target {
+    name: String,
+    liveness_probe: Option<probe::Probe>,
+    readiness_probe: Option<probe::Probe>,
+    startup_probe: Option<probe::Probe>,
+}
+
+fn parse_target(s: &str) -> Result<Target, String> {
+    serde_json::from_str(s).map_err(|e| e.to_string())
 }
 
 struct Status {
-    liveness: AtomicBool,
-    readiness: AtomicBool,
+    live: AtomicBool,
+    ready: AtomicBool,
 }
 
 impl Default for Status {
     fn default() -> Self {
         Self {
-            liveness: AtomicBool::new(true),
-            readiness: AtomicBool::new(false),
+            live: AtomicBool::new(true),
+            ready: AtomicBool::new(false),
         }
     }
 }
 
-fn update<'a, I>(context: &'a probe::Context, probe: I) -> impl Future<Output = ()> + 'a
-where
-    I: IntoIterator<Item = &'a (String, Probe, Status)>,
-{
-    futures::future::join_all(probe.into_iter().map(|(name, probe, status)| {
-        async move {
-            if let Some(probe) = &probe.startup {
-                let mut stream = pin::pin!(
-                    probe
-                        .watch(context)
-                        .instrument(tracing::info_span!("startup"))
-                );
-                while let Some(status) = stream.next().await {
-                    if status == probe::Status::Success {
-                        break;
-                    }
+fn update<'a>(
+    context: &'a probe::Context,
+    target: &'a Target,
+    status: &'a Status,
+) -> impl Future<Output = ()> + 'a {
+    async move {
+        if let Some(probe) = &target.startup_probe {
+            let mut stream = pin::pin!(
+                probe
+                    .watch(context)
+                    .instrument(tracing::info_span!("startup"))
+            );
+            while let Some(status) = stream.next().await {
+                if status == probe::Status::Success {
+                    break;
                 }
             }
-            futures::future::join(
-                async {
-                    if let Some(probe) = &probe.liveness {
-                        let mut stream = pin::pin!(
-                            probe
-                                .watch(context)
-                                .instrument(tracing::info_span!("liveness"))
-                        );
-                        while let Some(s) = stream.next().await {
-                            if s == probe::Status::Failure {
-                                status.liveness.store(false, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-                },
-                async {
-                    if let Some(probe) = &probe.readiness {
-                        let mut stream = pin::pin!(
-                            probe
-                                .watch(context)
-                                .instrument(tracing::info_span!("readiness"))
-                        );
-                        while let Some(s) = stream.next().await {
-                            match s {
-                                probe::Status::Success => {
-                                    status.readiness.store(true, Ordering::Relaxed)
-                                }
-                                probe::Status::Failure => {
-                                    status.readiness.store(false, Ordering::Relaxed)
-                                }
-                            }
-                        }
-                    } else {
-                        status.readiness.store(true, Ordering::Relaxed)
-                    }
-                },
-            )
-            .await;
         }
-        .instrument(tracing::info_span!("probe", name))
-    }))
-    .map(|_| ())
+        futures::future::join(
+            async {
+                if let Some(probe) = &target.liveness_probe {
+                    let mut stream = pin::pin!(
+                        probe
+                            .watch(context)
+                            .instrument(tracing::info_span!("liveness"))
+                    );
+                    while let Some(s) = stream.next().await {
+                        if s == probe::Status::Failure {
+                            status.live.store(false, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            },
+            async {
+                if let Some(probe) = &target.readiness_probe {
+                    let mut stream = pin::pin!(
+                        probe
+                            .watch(context)
+                            .instrument(tracing::info_span!("readiness"))
+                    );
+                    while let Some(s) = stream.next().await {
+                        match s {
+                            probe::Status::Success => status.ready.store(true, Ordering::Relaxed),
+                            probe::Status::Failure => status.ready.store(false, Ordering::Relaxed),
+                        }
+                    }
+                } else {
+                    status.ready.store(true, Ordering::Relaxed)
+                }
+            },
+        )
+        .await;
+    }
+    .instrument(tracing::info_span!("target", name = target.name))
 }
 
 #[cfg(test)]

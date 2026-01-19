@@ -43,7 +43,6 @@ impl<'de> Deserialize<'de> for super::Method {
     where
         D: Deserializer<'de>,
     {
-        #[serde_with::serde_as]
         #[derive(Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum Method {
