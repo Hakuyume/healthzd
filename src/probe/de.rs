@@ -52,12 +52,19 @@ impl<'de> Deserialize<'de> for super::Method {
             // https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/#http-probes
             HttpGet {
                 host: Option<String>,
-                scheme: Option<String>,
+                scheme: Option<Scheme>,
                 path: Option<String>,
                 #[serde(with = "http_serde::option::header_map", default)]
                 http_headers: Option<http::HeaderMap>,
                 port: Option<u16>,
             },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "UPPERCASE")]
+        enum Scheme {
+            Http,
+            Https,
         }
 
         let value = Method::deserialize(deserializer)?;
@@ -82,10 +89,9 @@ impl<'de> Deserialize<'de> for super::Method {
                 port,
             } => {
                 let mut uri = String::new();
-                if let Some(scheme) = scheme {
-                    uri.push_str(&scheme.to_lowercase());
-                } else {
-                    uri.push_str("http");
+                match scheme {
+                    Some(Scheme::Http) | None => uri.push_str("http"),
+                    Some(Scheme::Https) => uri.push_str("https"),
                 }
                 uri.push_str("://");
                 if let Some(host) = host {

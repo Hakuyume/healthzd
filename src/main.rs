@@ -5,6 +5,7 @@ use axum::{Router, routing};
 use clap::Parser;
 use futures::{FutureExt, StreamExt};
 use serde::Deserialize;
+use std::io;
 use std::net::SocketAddr;
 use std::pin;
 use std::sync::Arc;
@@ -34,47 +35,10 @@ async fn main() -> anyhow::Result<()> {
         .target
         .into_iter()
         .map(|target| (target, Status::default()))
-        .collect::<Arc<[_]>>();
+        .collect();
 
     futures::future::try_join(
-        async {
-            let app = Router::new()
-                .route(
-                    "/live",
-                    routing::get({
-                        let targets = targets.clone();
-                        async move || {
-                            if targets
-                                .iter()
-                                .all(|(_, status)| status.live.load(Ordering::Relaxed))
-                            {
-                                http::StatusCode::OK
-                            } else {
-                                http::StatusCode::INTERNAL_SERVER_ERROR
-                            }
-                        }
-                    }),
-                )
-                .route(
-                    "/ready",
-                    routing::get({
-                        let targets = targets.clone();
-                        async move || {
-                            if targets
-                                .iter()
-                                .all(|(_, status)| status.ready.load(Ordering::Relaxed))
-                            {
-                                http::StatusCode::OK
-                            } else {
-                                http::StatusCode::SERVICE_UNAVAILABLE
-                            }
-                        }
-                    }),
-                );
-
-            let listener = tokio::net::TcpListener::bind(args.bind).await?;
-            axum::serve(listener, app).await
-        },
+        serve(args.bind, &targets),
         futures::future::join_all(
             targets
                 .iter()
@@ -111,6 +75,46 @@ impl Default for Status {
             ready: AtomicBool::new(false),
         }
     }
+}
+
+async fn serve(bind: SocketAddr, targets: &Arc<[(Target, Status)]>) -> io::Result<()> {
+    let app = Router::new()
+        .route(
+            "/live",
+            routing::get({
+                let targets = targets.clone();
+                async move || {
+                    if targets
+                        .iter()
+                        .all(|(_, status)| status.live.load(Ordering::Relaxed))
+                    {
+                        http::StatusCode::OK
+                    } else {
+                        http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }
+            }),
+        )
+        .route(
+            "/ready",
+            routing::get({
+                let targets = targets.clone();
+                async move || {
+                    if targets
+                        .iter()
+                        .all(|(_, status)| status.ready.load(Ordering::Relaxed))
+                    {
+                        http::StatusCode::OK
+                    } else {
+                        http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+        .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    axum::serve(listener, app).await
 }
 
 fn update<'a>(
